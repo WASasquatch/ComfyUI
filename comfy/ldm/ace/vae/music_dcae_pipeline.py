@@ -1,11 +1,7 @@
 # Original from: https://github.com/ace-step/ACE-Step/blob/main/music_dcae/music_dcae_pipeline.py
 import torch
 from .autoencoder_dc import AutoencoderDC
-import logging
-try:
-    import torchaudio
-except:
-    logging.warning("torchaudio missing, ACE model will be broken")
+import comfy.audio
 
 import torchvision.transforms as transforms
 from .music_vocoder import ADaMoSHiFiGANV1
@@ -23,8 +19,6 @@ class MusicDCAE(torch.nn.Module):
         else:
             self.source_sample_rate = source_sample_rate
 
-        # self.resampler = torchaudio.transforms.Resample(source_sample_rate, 44100)
-
         self.transform = transforms.Compose([
             transforms.Normalize(0.5, 0.5),
         ])
@@ -36,10 +30,6 @@ class MusicDCAE(torch.nn.Module):
         self.latent_chunk_size = self.mel_chunk_size // self.time_dimention_multiple
         self.scale_factor = 0.1786
         self.shift_factor = -1.9091
-
-    def load_audio(self, audio_path):
-        audio, sr = torchaudio.load(audio_path)
-        return audio, sr
 
     def forward_mel(self, audios):
         mels = []
@@ -59,7 +49,7 @@ class MusicDCAE(torch.nn.Module):
             sr = self.source_sample_rate
 
         if sr != 44100:
-            audios = torchaudio.functional.resample(audios, sr, 44100)
+            audios = comfy.audio.resample(audios, sr, 44100)
 
         max_audio_len = audios.shape[-1]
         if max_audio_len % (8 * 512) != 0:
@@ -73,10 +63,8 @@ class MusicDCAE(torch.nn.Module):
             latent = self.dcae.encoder(mel.unsqueeze(0))
             latents.append(latent)
         latents = torch.cat(latents, dim=0)
-        # latent_lengths = (audio_lengths / sr * 44100 / 512 / self.time_dimention_multiple).long()
         latents = (latents - self.shift_factor) * self.scale_factor
         return latents
-        # return latents, latent_lengths
 
     @torch.no_grad()
     def decode(self, latents, audio_lengths=None, sr=None):
@@ -91,9 +79,7 @@ class MusicDCAE(torch.nn.Module):
             wav = self.vocoder.decode(mels[0]).squeeze(1)
 
             if sr is not None:
-                # resampler = torchaudio.transforms.Resample(44100, sr).to(latents.device).to(latents.dtype)
-                wav = torchaudio.functional.resample(wav, 44100, sr)
-                # wav = resampler(wav)
+                wav = comfy.audio.resample(wav, 44100, sr)
             else:
                 sr = 44100
             pred_wavs.append(wav)
@@ -101,7 +87,6 @@ class MusicDCAE(torch.nn.Module):
         if audio_lengths is not None:
             pred_wavs = [wav[:, :length].cpu() for wav, length in zip(pred_wavs, audio_lengths)]
         return torch.stack(pred_wavs)
-        # return sr, pred_wavs
 
     def forward(self, audios, audio_lengths=None, sr=None):
         latents, latent_lengths = self.encode(audios=audios, audio_lengths=audio_lengths, sr=sr)

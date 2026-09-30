@@ -23,7 +23,9 @@ from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from torch import nn
 
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import AttentionTensorContainer, ComfyAttention, optimized_attention
+import comfy.model_management
+import comfy.quant_ops
 
 
 def get_normalization(name: str, channels: int, weight_args={}, operations=None):
@@ -89,6 +91,7 @@ class Attention(nn.Module):
         operations=None,
     ) -> None:
         super().__init__()
+        self.comfy_attention = ComfyAttention()
 
         self.is_selfattn = context_dim is None  # self attention
 
@@ -157,17 +160,20 @@ class Attention(nn.Module):
         k = self.to_k[1](k)
         v = self.to_v[1](v)
         if self.is_selfattn and rope_emb is not None:  # only apply to self-attention!
-            # apply_rotary_pos_emb inlined
-            q_shape = q.shape
-            q = q.reshape(*q.shape[:-1], 2, -1).movedim(-2, -1).unsqueeze(-2)
-            q = rope_emb[..., 0] * q[..., 0] + rope_emb[..., 1] * q[..., 1]
-            q = q.movedim(-1, -2).reshape(*q_shape).to(x.dtype)
+            if not comfy.model_management.in_training:
+                q, k = comfy.quant_ops.ck.apply_rope_split_half(q, k, rope_emb)
+            else:
+                # apply_rotary_pos_emb inlined
+                q_shape = q.shape
+                q = q.reshape(*q.shape[:-1], 2, -1).movedim(-2, -1).unsqueeze(-2)
+                q = rope_emb[..., 0] * q[..., 0] + rope_emb[..., 1] * q[..., 1]
+                q = q.movedim(-1, -2).reshape(*q_shape).to(x.dtype)
 
-            # apply_rotary_pos_emb inlined
-            k_shape = k.shape
-            k = k.reshape(*k.shape[:-1], 2, -1).movedim(-2, -1).unsqueeze(-2)
-            k = rope_emb[..., 0] * k[..., 0] + rope_emb[..., 1] * k[..., 1]
-            k = k.movedim(-1, -2).reshape(*k_shape).to(x.dtype)
+                # apply_rotary_pos_emb inlined
+                k_shape = k.shape
+                k = k.reshape(*k.shape[:-1], 2, -1).movedim(-2, -1).unsqueeze(-2)
+                k = rope_emb[..., 0] * k[..., 0] + rope_emb[..., 1] * k[..., 1]
+                k = k.movedim(-1, -2).reshape(*k_shape).to(x.dtype)
         return q, k, v
 
     def forward(
@@ -176,6 +182,7 @@ class Attention(nn.Module):
         context=None,
         mask=None,
         rope_emb=None,
+        transformer_options={},
         **kwargs,
     ):
         """
@@ -184,7 +191,8 @@ class Attention(nn.Module):
             context (Optional[Tensor]): The key tensor of shape [B, Mk, K] or use x as context [self attention] if None
         """
         q, k, v = self.cal_qkv(x, context, mask, rope_emb=rope_emb, **kwargs)
-        out = optimized_attention(q, k, v, self.heads, skip_reshape=True, mask=mask, skip_output_reshape=True)
+        q, k, v = AttentionTensorContainer(q), AttentionTensorContainer(k), AttentionTensorContainer(v)
+        out = optimized_attention(q, k, v, self.heads, skip_reshape=True, mask=mask, skip_output_reshape=True, preferred_attention=self.comfy_attention, transformer_options=transformer_options)
         del q, k, v
         out = rearrange(out, " b n s c -> s b (n c)")
         return self.to_out(out)
@@ -546,6 +554,7 @@ class VideoAttn(nn.Module):
         context: Optional[torch.Tensor] = None,
         crossattn_mask: Optional[torch.Tensor] = None,
         rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
+        transformer_options: Optional[dict] = {},
     ) -> torch.Tensor:
         """
         Forward pass for video attention.
@@ -571,6 +580,7 @@ class VideoAttn(nn.Module):
             context_M_B_D,
             crossattn_mask,
             rope_emb=rope_emb_L_1_1_D,
+            transformer_options=transformer_options,
         )
         x_T_H_W_B_D = rearrange(x_THW_B_D, "(t h w) b d -> t h w b d", h=H, w=W)
         return x_T_H_W_B_D
@@ -665,6 +675,7 @@ class DITBuildingBlock(nn.Module):
         crossattn_mask: Optional[torch.Tensor] = None,
         rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
         adaln_lora_B_3D: Optional[torch.Tensor] = None,
+        transformer_options: Optional[dict] = {},
     ) -> torch.Tensor:
         """
         Forward pass for dynamically configured blocks with adaptive normalization.
@@ -702,6 +713,7 @@ class DITBuildingBlock(nn.Module):
                 adaln_norm_state(self.norm_state, x, scale_1_1_1_B_D, shift_1_1_1_B_D),
                 context=None,
                 rope_emb_L_1_1_D=rope_emb_L_1_1_D,
+                transformer_options=transformer_options,
             )
         elif self.block_type in ["cross_attn", "ca"]:
             x = x + gate_1_1_1_B_D * self.block(
@@ -709,6 +721,7 @@ class DITBuildingBlock(nn.Module):
                 context=crossattn_emb,
                 crossattn_mask=crossattn_mask,
                 rope_emb_L_1_1_D=rope_emb_L_1_1_D,
+                transformer_options=transformer_options,
             )
         else:
             raise ValueError(f"Unknown block type: {self.block_type}")
@@ -784,6 +797,7 @@ class GeneralDITTransformerBlock(nn.Module):
         crossattn_mask: Optional[torch.Tensor] = None,
         rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
         adaln_lora_B_3D: Optional[torch.Tensor] = None,
+        transformer_options: Optional[dict] = {},
     ) -> torch.Tensor:
         for block in self.blocks:
             x = block(
@@ -793,5 +807,6 @@ class GeneralDITTransformerBlock(nn.Module):
                 crossattn_mask,
                 rope_emb_L_1_1_D=rope_emb_L_1_1_D,
                 adaln_lora_B_3D=adaln_lora_B_3D,
+                transformer_options=transformer_options,
             )
         return x

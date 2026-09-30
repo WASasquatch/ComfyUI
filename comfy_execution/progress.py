@@ -1,4 +1,4 @@
-from typing import TypedDict, Dict, Optional
+from typing import TypedDict, Dict, Optional, Tuple
 from typing_extensions import override
 from PIL import Image
 from enum import Enum
@@ -7,9 +7,11 @@ from tqdm import tqdm
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from comfy_execution.graph import DynamicPrompt
+    from comfy_execution.server_protocol import ExecutionServer
 from protocol import BinaryEventTypes
 from comfy_api import feature_flags
 
+PreviewImageTuple = Tuple[str, Image.Image, Optional[int]]
 
 class NodeState(Enum):
     Pending = "pending"
@@ -52,7 +54,7 @@ class ProgressHandler(ABC):
         max_value: float,
         state: NodeProgressState,
         prompt_id: str,
-        image: Optional[Image.Image] = None,
+        image: PreviewImageTuple | None = None,
     ):
         """Called when a node's progress is updated"""
         pass
@@ -103,7 +105,7 @@ class CLIProgressHandler(ProgressHandler):
         max_value: float,
         state: NodeProgressState,
         prompt_id: str,
-        image: Optional[Image.Image] = None,
+        image: PreviewImageTuple | None = None,
     ):
         # Handle case where start_handler wasn't called
         if node_id not in self.progress_bars:
@@ -149,7 +151,7 @@ class WebUIProgressHandler(ProgressHandler):
     Handler that sends progress updates to the WebUI via WebSockets.
     """
 
-    def __init__(self, server_instance):
+    def __init__(self, server_instance: "ExecutionServer"):
         super().__init__("webui")
         self.server_instance = server_instance
 
@@ -178,8 +180,9 @@ class WebUIProgressHandler(ProgressHandler):
         }
 
         # Send a combined progress_state message with all node states
+        # Include client_id to ensure message is only sent to the initiating client
         self.server_instance.send_sync(
-            "progress_state", {"prompt_id": prompt_id, "nodes": active_nodes}
+            "progress_state", {"prompt_id": prompt_id, "nodes": active_nodes}, self.server_instance.client_id
         )
 
     @override
@@ -196,7 +199,7 @@ class WebUIProgressHandler(ProgressHandler):
         max_value: float,
         state: NodeProgressState,
         prompt_id: str,
-        image: Optional[Image.Image] = None,
+        image: PreviewImageTuple | None = None,
     ):
         # Send progress state of all nodes
         if self.registry:
@@ -230,7 +233,6 @@ class WebUIProgressHandler(ProgressHandler):
         # Send progress state of all nodes
         if self.registry:
             self._send_progress_state(prompt_id, self.registry.nodes)
-
 
 class ProgressRegistry:
     """
@@ -285,7 +287,7 @@ class ProgressRegistry:
                 handler.start_handler(node_id, entry, self.prompt_id)
 
     def update_progress(
-        self, node_id: str, value: float, max_value: float, image: Optional[Image.Image]
+        self, node_id: str, value: float, max_value: float, image: PreviewImageTuple | None = None
     ) -> None:
         """Update progress for a node"""
         entry = self.ensure_entry(node_id)
@@ -317,7 +319,7 @@ class ProgressRegistry:
             handler.reset()
 
 # Global registry instance
-global_progress_registry: ProgressRegistry = None
+global_progress_registry: ProgressRegistry | None = None
 
 def reset_progress_state(prompt_id: str, dynprompt: "DynamicPrompt") -> None:
     global global_progress_registry
